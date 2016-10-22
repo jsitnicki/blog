@@ -39,7 +39,7 @@ attach the script to a TAP device linking to the VM.
 
 I like to use Andrew Lutomirski's `virtme`_ tool to spin up toy VMs
 but it's doesn't matter what you use - qemu, virsh,
-virt-manager... What is important is the vNIC model you use. For
+virt-manager... What is important is the vNIC model you choose. For
 example, I had problems with virtio_net v1.0.0 driver
 (qemu-system-x86-2.6.2-2.fc24.x86_64), which seems to be filtering
 VLAN 0 tagged frames when the device is not in promiscuous mode. A
@@ -65,8 +65,8 @@ Let's start up a VM::
   version: 7.3.21-k8-NAPI
   …
 
-The virtio-net virtual network device is there. Let's assign it an
-address bring it up::
+The ``e1000`` virtual network device is there. Let's assign it an
+address and bring it up::
 
   bash-4.3# ip address add dev ens2 10.1.1.1/24
   bash-4.3# ip link set dev ens2 up
