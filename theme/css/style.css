@@ -209,6 +209,12 @@ div#blogroll ul li {
   list-style: none;
 }
 
+/* Scale figures below the width of the text column and center them */
+div.figure object {
+    width: 80%;
+    margin-left: 10%;
+}
+
 #contentinfo {
   width: 100%;
   height: auto;

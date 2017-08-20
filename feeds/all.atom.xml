@@ -1,5 +1,315 @@
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><title>Jakub Sitnicki's blog</title><link href="http://codecave.cc/" rel="alternate"></link><link href="http://codecave.cc/feeds/all.atom.xml" rel="self"></link><id>http://codecave.cc/</id><updated>2017-06-24T00:00:00+02:00</updated><entry><title>Multipath Routing in Linux - part 1</title><link href="http://codecave.cc/multipath-routing-in-linux-part-1.html" rel="alternate"></link><published>2017-06-24T00:00:00+02:00</published><updated>2017-06-24T00:00:00+02:00</updated><author><name>Jakub Sitnicki &lt;jkbs@redhat.com&gt;</name></author><id>tag:codecave.cc,2017-06-24:/multipath-routing-in-linux-part-1.html</id><summary type="html"></summary><content type="html">&lt;p&gt;This blog post takes a look at the current state of Multipath Routing
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Jakub Sitnicki's blog</title><link href="http://codecave.cc/" rel="alternate"></link><link href="http://codecave.cc/feeds/all.atom.xml" rel="self"></link><id>http://codecave.cc/</id><updated>2017-08-20T00:00:00+02:00</updated><entry><title>Multipath Routing in Linux - part 2</title><link href="http://codecave.cc/multipath-routing-in-linux-part-2.html" rel="alternate"></link><published>2017-08-20T00:00:00+02:00</published><updated>2017-08-20T00:00:00+02:00</updated><author><name>Jakub Sitnicki &lt;jkbs@redhat.com&gt;</name></author><id>tag:codecave.cc,2017-08-20:/multipath-routing-in-linux-part-2.html</id><summary type="html"></summary><content type="html">&lt;p&gt;&lt;a class="reference external" href="http://codecave.cc/multipath-routing-in-linux-part-1.html"&gt;Last time&lt;/a&gt; we have looked at what is multipath routing, what are
+some potential use-cases for it, and how to set it up. In this post we
+explore deeper the multipath routing implementation in the Linux
+network routing subsystem and focus on the logic behind distributing
+packet flows between alternative (equal cost) paths.&lt;/p&gt;
+&lt;div class="section" id="two-stacks-two-stories"&gt;
+&lt;h2&gt;Two stacks, two stories&lt;/h2&gt;
+&lt;p&gt;While you might expect that multipath routing in Linux works the same
+for IPv4 and IPv6, that is not the case. As we have seen in &lt;a class="reference external" href="http://codecave.cc/multipath-routing-in-linux-part-1.html#history-dive"&gt;&amp;quot;History
+dive&amp;quot; in part 1&lt;/a&gt; support for ECMP (Equal-cost Multipath) routing in
+ipv4 and ipv6 stacks &lt;a class="footnote-reference" href="#f0" id="id1"&gt;[1]&lt;/a&gt; has been introduced at different times and
+by different developers. Hence the implementations differ and this
+impacts how multipath routing can be configured and how it operates.&lt;/p&gt;
+&lt;p&gt;In the rest of this post I will concentrate solely on the state of
+Multipath Routing in Linux v4.11. However, because it is interesting
+to see how the code evolved over time, here is a timeline that
+attempts to recap the interesting points in the kernel development
+that affected multipath routing:&lt;/p&gt;
+&lt;ul class="simple"&gt;
+&lt;li&gt;1997-Nov v2.1.68 Initial support for Multipath Routing for
+IPv4. Included support for weighted ECMP (which I talk about
+later). Next-hop selected in a pseudo-random fashion (&lt;cite&gt;jiffies&lt;/cite&gt;
+value used as a random number).&lt;/li&gt;
+&lt;li&gt;2012-Sep v3.6 IPv4 routing cache removed, which made Multipath
+Routing unusable with connection-oriented protocols like TCP as
+different next-hops could be selected for packets belonging to the
+same flow. See &lt;a class="reference external" href="https://serverfault.com/questions/696675/multipath-routing-in-post-3-6-kernels"&gt;discussion at ServerFault&lt;/a&gt;:&lt;/li&gt;
+&lt;/ul&gt;
+&lt;ul class="simple"&gt;
+&lt;li&gt;2013-Feb v3.8 Initial support for Multipath Routing for
+IPv6. Packets belonging to one flow always routed toward the same
+next-hop thanks to path selection based on the flow hash. Weighted
+ECMP is not supported.&lt;/li&gt;
+&lt;li&gt;2016-Jan v4.4 Multipath routing for IPv4 switched to flow hash-based
+path selection, making connection-oriented protocols usable with
+ECMP again.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;It is also worth mentioning that between v2.6.12 (2005-Jun) and
+v2.6.23 (2007-Oct) there has been an experimental cache support for
+Multipath Routing but it's not relevant to current (v4.11)
+implementation since routing cache has been removed &lt;a class="footnote-reference" href="#f1" id="id2"&gt;[2]&lt;/a&gt;.&lt;/p&gt;
+&lt;/div&gt;
+&lt;div class="section" id="the-ecmp-algorithm-mapping-packets-to-next-hops"&gt;
+&lt;h2&gt;The ECMP algorithm - mapping packets to next-hops&lt;/h2&gt;
+&lt;p&gt;It is important to keep in mind that existing Multipath Routing
+implementation in Linux is designed to distribute flows of packets
+over multiple paths, not individual packets. Selecting route in a
+per-packet manner does not play well with TCP, IP fragments, or Path
+MTU Discovery.&lt;/p&gt;
+&lt;p&gt;To associate a packet with a flow, the net stack computes a hash over
+a subset of packet header fields. The resulting hash value is what
+drives the next-hop selection. In Linux v4.11 the selection of fields
+depends on the IP protocol version and whether we are forwarding or
+routing locally generated packets. The fields that serve as input to
+hashing function are:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;p class="first"&gt;for forwarded IPv4 packets (L3 hash)&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+{ Source Address, Destination Address }
+&lt;/pre&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;p class="first"&gt;for locally generated IPv4 packets (L4 hash) &lt;a class="footnote-reference" href="#f2" id="id3"&gt;[3]&lt;/a&gt;&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+{ Source Address, Destination Address, Protocol, Source Port, Destination Port }
+&lt;/pre&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;p class="first"&gt;for forwarded IPv6 packets (L3 hash)&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+{ Source Address, Destination Address, Flow Label, Next Header (protocol) }
+&lt;/pre&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;p class="first"&gt;for locally generated IPv6 packets (L4 hash)&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+{ Source Address, Destination Address, Flow Label, Next Header (protocol), Source Port, Destination Port }
+&lt;/pre&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;However, with recently released Linux v4.12 selection of fields has
+changed a bit for IPv4 &lt;a class="footnote-reference" href="#f3" id="id4"&gt;[4]&lt;/a&gt;. An L3 hash is used by default for both
+forwarded and locally generated traffic, but the user can choose to
+use the L4 hash, in both forward and local output path, with a new
+sysctl - &lt;tt class="docutils literal"&gt;net.ipv4.fib_multipath_hash_policy&lt;/tt&gt;.&lt;/p&gt;
+&lt;p&gt;How this flow-hash value is mapped to one of the available next-hops
+is where the Linux ipv4 and ipv6 stacks differ. The ipv4 stack
+implements a so called Hash-Threshold algorithm which splits all
+possible hash values into adjacent ranges, each one corresponding to
+one of the available next-hops. The ipv6 stack, on the other hand,
+employs a somewhat simpler Modulo-N algorithm, which computes the
+next-hop index from the hash value by means of modulo division.&lt;/p&gt;
+&lt;div class="figure"&gt;
+&lt;object data="http://codecave.cc/figures/next-hop-algo.svg" type="image/svg+xml"&gt;
+&lt;/object&gt;
+&lt;p class="caption"&gt;Figure 1. Next-hop mapping with hash-threshold vs module-N algorithm&lt;/p&gt;
+&lt;/div&gt;
+&lt;p&gt;These mapping schemes are implemented by &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv4/fib_semantics.c#L1620"&gt;fib_select_multipath()&lt;/a&gt; and
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv6/route.c#L462"&gt;rt6_multipath_select()&lt;/a&gt; routines for ipv4 and ipv6, respectively.&lt;/p&gt;
+&lt;p&gt;With some setup and a bit of pointer-chasing in &lt;tt class="docutils literal"&gt;gdb&lt;/tt&gt; we can see
+&lt;a class="footnote-reference" href="#f4" id="id5"&gt;[5]&lt;/a&gt; how Linux ipv4 stack splits up the hash value range
+&lt;tt class="docutils literal"&gt;&lt;span class="pre"&gt;{0..INT_MAX}&lt;/span&gt;&lt;/tt&gt; between available next-hops. Because the ranges are
+adjacent we only need to keep track of the upper bound.&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+# for i in {1..3}; do
+&amp;gt;   ip link add test$i type dummy
+&amp;gt;   ip link set dev test$i up
+&amp;gt;   ip addr add dev test$i 192.168.$i.2/24
+&amp;gt; done
+# ip route add 2.2.2.2/32 \
+&amp;gt;   nexthop via 192.168.1.1 \
+&amp;gt;   nexthop via 192.168.2.1 \
+&amp;gt;   nexthop via 192.168.3.1
+# ip route show 2.2.2.2
+2.2.2.2
+        nexthop via 192.168.1.1 dev test1 weight 1
+        nexthop via 192.168.2.1 dev test2 weight 1
+        nexthop via 192.168.3.1 dev test3 weight 1
+# gdb gdb /usr/lib/debug/usr/lib/modules/`uname -r`/vmlinux /proc/kcore
+...
+(gdb) p *(struct fib_info *)fib_info_hash[14].first
+$41 = {
+  ...
+  fib_nhs = 3,
+  ...
+  fib_nh = 0xffff88003d1d9070
+}
+(gdb) set $fib_info = (struct fib_info *)fib_info_hash[14].first
+(gdb) p $fib_info.fib_nh[0].nh_upper_bound
+$32 = {
+  counter = 715827882  # &amp;lt;-- INT_MAX/3
+}
+(gdb) p $fib_info.fib_nh[1].nh_upper_bound
+$33 = {
+  counter = 1431655764 # &amp;lt;-- INT_MAX/3*2
+}
+(gdb) p $fib_info.fib_nh[2].nh_upper_bound
+$34 = {
+  counter = 2147483647 # &amp;lt;-- INT_MAX
+}
+(gdb)
+&lt;/pre&gt;
+&lt;p&gt;Both of the algorithms, Hash-Threshold and Modulo-N, are
+deterministic, in a sense that the same next-hop is always selected
+for the same flow, as long as the set of next-hops has not changed in
+the meantime. This is something that is desired in practice, enabling
+the same client to always talk to the same server.&lt;/p&gt;
+&lt;p&gt;It is also worth noting that the Hash-Threshold and the Modulo-N
+algorithms differ in how disruptive &lt;a class="footnote-reference" href="#f7" id="id6"&gt;[6]&lt;/a&gt; they are to the packet
+flows when the set of next-hops changes. In this regard, the Modulo-N
+algorithm used by the ipv6 stack is more disruptive, that is a larger
+percentage of potential flows is affected (re-routed) when a next-hop
+is added to or removed from the set of available paths.&lt;/p&gt;
+&lt;p&gt;The algorithms are described and analyzed in more detail in:&lt;/p&gt;
+&lt;ul class="simple"&gt;
+&lt;li&gt;&lt;a class="reference external" href="https://tools.ietf.org/html/rfc2991"&gt;RFC 2991&lt;/a&gt; - Multipath Issues in Unicast and Multicast Next-Hop Selection&lt;/li&gt;
+&lt;li&gt;&lt;a class="reference external" href="https://tools.ietf.org/html/rfc2992"&gt;RFC 2992&lt;/a&gt; - Analysis of an Equal-Cost Multi-Path Algorithm&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/div&gt;
+&lt;div class="section" id="weighted-ecmp-promoting-selected-next-hops"&gt;
+&lt;h2&gt;Weighted ECMP - promoting selected next-hops&lt;/h2&gt;
+&lt;p&gt;Weighted Equal-Cost Multi-Path routing is an extension to the concept
+of multipath routing where additionally every next-hop has an
+associated &amp;quot;weight&amp;quot;. The weight affects how big of a fraction of all
+possible flows will be routed toward the next-hop.&lt;/p&gt;
+&lt;p&gt;Currently (as of Linux v4.12) only the ipv4 stack respects the
+next-hop weight and steers more flows toward a path with a higher
+weight. Digging into the code, we can see the weight (stored in
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/net/ip_fib.h#L83"&gt;nh_weight&lt;/a&gt; in &lt;tt class="docutils literal"&gt;struct fib_nh&lt;/tt&gt;) being taken into account by
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv4/fib_semantics.c#L572"&gt;fib_rebalance()&lt;/a&gt; routine which computes the upper range limit of a
+next-hop (&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/net/ip_fib.h#L84"&gt;nh_upper_bound&lt;/a&gt;) we looked at earlier.&lt;/p&gt;
+&lt;p&gt;To tell the kernel that we want the next-hops to have different
+weights we need to pass the &lt;tt class="docutils literal"&gt;weight&lt;/tt&gt; parameter to &lt;tt class="docutils literal"&gt;ip route&lt;/tt&gt;
+command. The specified value will be handed to the kernel in
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/uapi/linux/rtnetlink.h#L342"&gt;rtnh_hops&lt;/a&gt; attribute of a next-hop data structure.&lt;/p&gt;
+&lt;p&gt;For example, if we want 2/3 (or 10/15) of all possible flows to be
+routed towards &lt;tt class="docutils literal"&gt;192.168.1.1&lt;/tt&gt; next-hop and the remaining 1/3 (or
+5/15) toward &lt;tt class="docutils literal"&gt;192.168.2.1&lt;/tt&gt; we can set up a multipath route with:&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+# ip route add 2.2.2.2/32 \
+&amp;gt; nexthop via 192.168.1.1 weight 10 \
+&amp;gt; nexthop via 192.168.2.1 weight 5
+# ip route show 2.2.2.2
+2.2.2.2
+        nexthop via 192.168.1.1 dev dum1 weight 10
+        nexthop via 192.168.2.1 dev dum2 weight 5
+&lt;/pre&gt;
+&lt;p&gt;Just as before, we can take a look at &lt;tt class="docutils literal"&gt;fib_info&lt;/tt&gt; structure to see
+that the next-hop-mapped hash value ranges have been set up as
+expected:&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+192.168.1.1 → {0..INT_MAX*2/3}
+192.168.2.1 → {INT_MAX*2/3+1..INT_MAX}
+&lt;/pre&gt;
+&lt;p&gt;Digging in again with &lt;tt class="docutils literal"&gt;gdb&lt;/tt&gt; we see:&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+(gdb) set $ip = $fib_info-&amp;gt;fib_nh[0].nh_gw
+(gdb) printf &amp;quot;%d.%d.%d.%d\n&amp;quot;, ($ip &amp;amp; 0xff), ($ip &amp;gt;&amp;gt; 8) &amp;amp; 0xff, ($ip &amp;gt;&amp;gt; 16) &amp;amp; 0xff, ($ip &amp;gt;&amp;gt; 24)
+192.168.1.1
+(gdb) p $fib_info-&amp;gt;fib_nh[0].nh_weight
+$14 = 10
+(gdb) p $fib_info-&amp;gt;fib_nh[0].nh_upper_bound.counter
+$15 = 1431655764 # &amp;lt;-- INT_MAX/3*2
+
+(gdb) set $ip = $fib_info-&amp;gt;fib_nh[1].nh_gw
+(gdb) printf &amp;quot;%d.%d.%d.%d\n&amp;quot;, ($ip &amp;amp; 0xff), ($ip &amp;gt;&amp;gt; 8) &amp;amp; 0xff, ($ip &amp;gt;&amp;gt; 16) &amp;amp; 0xff, ($ip &amp;gt;&amp;gt; 24)
+192.168.2.1
+(gdb) p $fib_info-&amp;gt;fib_nh[1].nh_weight
+$16 = 5
+(gdb) p $fib_info-&amp;gt;fib_nh[1].nh_upper_bound.counter
+$17 = 2147483647 # &amp;lt;-- INT_MAX
+&lt;/pre&gt;
+&lt;p&gt;Linux ipv6 stack, however, ignores the next-hop weight, passed from
+user-space in &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/uapi/linux/rtnetlink.h#L342"&gt;rtnh_hops&lt;/a&gt;. We can confirm this by looking at
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv6/route.c#L3283"&gt;inet6_rtm_newroute()&lt;/a&gt; invoked to process &lt;tt class="docutils literal"&gt;RTM_NEWROUTE&lt;/tt&gt; message,
+which is send to create a new routing entry.&lt;/p&gt;
+&lt;p&gt;What &lt;tt class="docutils literal"&gt;inet6_rtm_newroute()&lt;/tt&gt; does is - it calls a helper routine
+&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv6/route.c#L2985"&gt;rtm_to_fib6_config()&lt;/a&gt; to extract the pointer to the first &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/uapi/linux/rtnetlink.h#L339"&gt;struct
+rtnexthop&lt;/a&gt; from the message and store it &lt;a class="reference external" href="..."&gt;fc_mp&lt;/a&gt; field of &lt;tt class="docutils literal"&gt;struct
+fib6_config&lt;/tt&gt;. The stored list of &lt;tt class="docutils literal"&gt;rtnexthop&lt;/tt&gt;'s is later processed
+by &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv6/route.c#L3122"&gt;ip6_route_multipath_add()&lt;/a&gt; which does not access the &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/include/uapi/linux/rtnetlink.h#L342"&gt;rtnh_hops&lt;/a&gt;
+field.&lt;/p&gt;
+&lt;/div&gt;
+&lt;div class="section" id="wrap-up"&gt;
+&lt;h2&gt;Wrap up&lt;/h2&gt;
+&lt;p&gt;In this post we have explored how Mulipath Routing implementation has
+evolved over time in Linux ipv4 and ipv6 stacks. We have also seen how
+the two stacks differ in what ECMP algorithm they use to map flows to
+next-hops. Lastly we have looked at weighed ECMP setup where some
+next-hops are favored more than others and discovered that we it can
+be only used with IPv4.&lt;/p&gt;
+&lt;p&gt;If you are running Fedora, you can quickly try out all the commands
+using the awesome &lt;a class="reference external" href="https://github.com/amluto/virtme"&gt;virtme&lt;/a&gt;
+tool. Make sure you have &lt;tt class="docutils literal"&gt;virtme&lt;/tt&gt; and &lt;tt class="docutils literal"&gt;&lt;span class="pre"&gt;kernel-debuginfo&lt;/span&gt;&lt;/tt&gt; packages
+installed. Then simply run:&lt;/p&gt;
+&lt;pre class="literal-block"&gt;
+$ virtme-run --installed-kernel -a nokaslr --qemu-opts -m 1G
+...
+virtme-init: console is ttyS0
+bash-4.3# for i in 1 2; do
+&amp;gt;         ip link add dum$i type dummy
+&amp;gt;         ip link set dev dum$i up
+&amp;gt;         ip addr add dev dum$i 192.168.$i.2/24
+&amp;gt; done
+bash-4.3# ip route add 2.2.2.2/32 \
+&amp;gt;    nexthop via 192.168.1.1 weight 10 \
+&amp;gt;    nexthop via 192.168.2.1 weight 5
+bash-4.3# ip route show 2.2.2.2
+2.2.2.2
+        nexthop via 192.168.1.1 dev dum1 weight 10
+        nexthop via 192.168.2.1 dev dum2 weight 5
+bash-4.3# gdb /usr/lib/debug/lib/modules/`uname -r`/vmlinux /proc/kcore
+GNU gdb (GDB) Fedora 7.12.1-48.fc25
+...
+(gdb)
+&lt;/pre&gt;
+&lt;p class="rubric"&gt;Footnotes&lt;/p&gt;
+&lt;table class="docutils footnote" frame="void" id="f0" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id1"&gt;[1]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;From here on I will refer to the IPv4 network stack
+implementation in Linux that lives under &lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv4"&gt;net/ipv4/&lt;/a&gt; as
+ipv4 (all lower case) to distinguish it from the IPv4
+protocol. Same distinction applies to the IPv6 protocol and
+the ipv6 stack in Linux (&lt;a class="reference external" href="http://elixir.free-electrons.com/linux/v4.11/source/net/ipv6"&gt;net/ipv6/&lt;/a&gt;).&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;table class="docutils footnote" frame="void" id="f1" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id2"&gt;[2]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;I stumbled upon the description of Multipath Routing cache in
+&lt;a class="reference external" href="http://amzn.eu/1S08po2"&gt;Understanding Linux Network Internals&lt;/a&gt;,
+&lt;cite&gt;&amp;quot;Cache Support for Multipath&amp;quot;&lt;/cite&gt; section if you would like to know
+more about it.&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;table class="docutils footnote" frame="void" id="f2" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id3"&gt;[3]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;since commit &lt;a class="reference external" href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=9920e48b830a"&gt;9920e48b830a (&amp;quot;ipv4: use l4 hash for locally
+generated multipath flows&amp;quot;)&lt;/a&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;table class="docutils footnote" frame="void" id="f3" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id4"&gt;[4]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;see commit &lt;a class="reference external" href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=bf4e0a3db97eb882368fd82980b3b1fa0b5b9778"&gt;bf4e0a3db97e (&amp;quot;net: ipv4: add support for ECMP hash
+policy choice&amp;quot;)&lt;/a&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;table class="docutils footnote" frame="void" id="f4" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id5"&gt;[5]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;If all values in &lt;tt class="docutils literal"&gt;gdb&lt;/tt&gt; show up as zeros you are likely
+running a kernel with &lt;a class="reference external" href="https://lwn.net/Articles/569635/"&gt;KASLR&lt;/a&gt; enabled. Confirm by
+checking if &lt;tt class="docutils literal"&gt;CONFIG_RANDOMIZE_BASE&lt;/tt&gt; build option was set.
+You can disable KASLR by passing &lt;tt class="docutils literal"&gt;nokaslr&lt;/tt&gt; boot option to
+the kernel.&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;table class="docutils footnote" frame="void" id="f7" rules="none"&gt;
+&lt;colgroup&gt;&lt;col class="label" /&gt;&lt;col /&gt;&lt;/colgroup&gt;
+&lt;tbody valign="top"&gt;
+&lt;tr&gt;&lt;td class="label"&gt;&lt;a class="fn-backref" href="#id6"&gt;[6]&lt;/a&gt;&lt;/td&gt;&lt;td&gt;In this context, the flow is considered disrupted when the
+network path it takes changes.&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;!-- Links
+Understanding Linux Network Internals
+https://serverfault.com/questions/696675/multipath-routing-in-post-3-6-kernels
+https://serverfault.com/questions/276760/linux-multipath-routing-load-balance
+https://serverfault.com/questions/820269/how-to-achieve-per-packet-multipath-routing-on-linux --&gt;
+&lt;/div&gt;
+</content></entry><entry><title>Multipath Routing in Linux - part 1</title><link href="http://codecave.cc/multipath-routing-in-linux-part-1.html" rel="alternate"></link><published>2017-06-24T00:00:00+02:00</published><updated>2017-06-24T00:00:00+02:00</updated><author><name>Jakub Sitnicki &lt;jkbs@redhat.com&gt;</name></author><id>tag:codecave.cc,2017-06-24:/multipath-routing-in-linux-part-1.html</id><summary type="html"></summary><content type="html">&lt;p&gt;This blog post takes a look at the current state of Multipath Routing
 mechanism, also known as Equal Cost Multipath Routing (ECMP), in the
 Linux v4.11 network stack. If you're running a different kernel -
 don't worry. Jump to the &lt;a class="reference internal" href="#history-dive"&gt;History dive&lt;/a&gt; digression at the end to find
